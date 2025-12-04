@@ -8,6 +8,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.enums import ParseMode
 
 # Конфигурация
 BOT_TOKEN = "7725677007:AAELRuzM3MLnrWyi74PeWZgJDyqkwHzPPEo"
@@ -16,7 +17,7 @@ ADMIN_ID = 1576058332
 DATABASE_NAME = "invite_bot.db"
 
 # Инициализация бота
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 # Настройка логирования
@@ -119,8 +120,45 @@ async def is_channel_member(user_id: int) -> bool:
         chat = await bot.get_chat(f"@{CHANNEL_USERNAME}")
         member = await bot.get_chat_member(chat.id, user_id)
         return member.status in ['member', 'administrator', 'creator']
-    except:
+    except Exception as e:
+        logger.error(f"Ошибка при проверке участника: {e}")
         return False
+
+# Обработка реферала
+async def handle_referral(invited_user_id: int, inviter_id: int):
+    # Проверяем, не регистрировался ли уже этот пользователь
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT * FROM invited_users WHERE invited_user_id = ?', 
+            (invited_user_id,)
+        )
+        if cursor.fetchone():
+            return
+        
+        # Регистрируем приглашение
+        conn.execute(
+            '''INSERT INTO invited_users (inviter_id, invited_user_id) 
+               VALUES (?, ?)''',
+            (inviter_id, invited_user_id)
+        )
+        conn.commit()
+        
+    # Проверяем, вступил ли пользователь в канал
+    if await is_channel_member(invited_user_id):
+        update_balance(inviter_id, 3)
+        logger.info(f"Начислено 3 рубля пользователю {inviter_id} за приглашение {invited_user_id}")
+
+# Получение количества приглашенных
+def get_invited_count(user_id: int) -> int:
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT COUNT(*) FROM invited_users WHERE inviter_id = ?', 
+            (user_id,)
+        )
+        result = cursor.fetchone()
+        return result[0] if result else 0
 
 # Обработчик команды /start
 @dp.message(Command("start"))
@@ -172,31 +210,6 @@ async def cmd_start(message: types.Message):
         parse_mode="HTML"
     )
 
-# Обработка реферала
-async def handle_referral(invited_user_id: int, inviter_id: int):
-    # Проверяем, не регистрировался ли уже этот пользователь
-    with sqlite3.connect(DATABASE_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            'SELECT * FROM invited_users WHERE invited_user_id = ?', 
-            (invited_user_id,)
-        )
-        if cursor.fetchone():
-            return
-        
-        # Регистрируем приглашение
-        conn.execute(
-            '''INSERT INTO invited_users (inviter_id, invited_user_id) 
-               VALUES (?, ?)''',
-            (inviter_id, invited_user_id)
-        )
-        conn.commit()
-        
-    # Проверяем, вступил ли пользователь в канал
-    if await is_channel_member(invited_user_id):
-        update_balance(inviter_id, 3)
-        logger.info(f"Начислено 3 рубля пользователю {inviter_id} за приглашение {invited_user_id}")
-
 # Обработчик кнопки "Баланс"
 @dp.callback_query(F.data == "balance")
 async def show_balance(callback: types.CallbackQuery):
@@ -214,25 +227,25 @@ async def show_balance(callback: types.CallbackQuery):
     else:
         text += f"⏳ До минимальной суммы вывода осталось: {30 - balance:.2f} руб."
     
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")
-        ]]),
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-# Получение количества приглашенных
-def get_invited_count(user_id: int) -> int:
-    with sqlite3.connect(DATABASE_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            'SELECT COUNT(*) FROM invited_users WHERE inviter_id = ?', 
-            (user_id,)
+    # Кнопка назад
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+    ])
+    
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
         )
-        result = cursor.fetchone()
-        return result[0] if result else 0
+    except Exception as e:
+        await callback.message.answer(
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    
+    await callback.answer()
 
 # Обработчик кнопки "Пригласить друзей"
 @dp.callback_query(F.data == "invite")
@@ -250,14 +263,24 @@ async def show_invite_link(callback: types.CallbackQuery):
             f"⚠️ <b>Важно:</b> Если приглашенный отпишется от канала, с вашего баланса будет списано 3 рубля."
         )
         
-        await callback.message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📢 Поделиться ссылкой", url=f"https://t.me/share/url?url={user['invite_link']}&text=Присоединяйся%20к%20каналу!")],
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
-            ]),
-            parse_mode="HTML"
-        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Поделиться ссылкой", url=f"https://t.me/share/url?url={user['invite_link']}&text=Присоединяйся%20к%20каналу!")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+        ])
+        
+        try:
+            await callback.message.edit_text(
+                text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            await callback.message.answer(
+                text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+    
     await callback.answer()
 
 # Обработчик кнопки "Вывод средств"
@@ -266,16 +289,28 @@ async def withdraw_funds(callback: types.CallbackQuery):
     balance = get_balance(callback.from_user.id)
     
     if balance < 30:
-        await callback.message.edit_text(
-            f"❌ <b>Недостаточно средств!</b>\n\n"
-            f"💰 Ваш баланс: {balance:.2f} руб.\n"
-            f"💰 Минимальная сумма вывода: 30 руб.\n\n"
-            f"Пригласите ещё {int((30 - balance) / 3) + 1} друзей для вывода.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")
-            ]]),
-            parse_mode="HTML"
-        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+        ])
+        
+        try:
+            await callback.message.edit_text(
+                f"❌ <b>Недостаточно средств!</b>\n\n"
+                f"💰 Ваш баланс: {balance:.2f} руб.\n"
+                f"💰 Минимальная сумма вывода: 30 руб.\n\n"
+                f"Пригласите ещё {int((30 - balance) / 3) + 1} друзей для вывода.",
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            await callback.message.answer(
+                f"❌ <b>Недостаточно средств!</b>\n\n"
+                f"💰 Ваш баланс: {balance:.2f} руб.\n"
+                f"💰 Минимальная сумма вывода: 30 руб.\n\n"
+                f"Пригласите ещё {int((30 - balance) / 3) + 1} друзей для вывода.",
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
         await callback.answer()
         return
     
@@ -292,25 +327,41 @@ async def withdraw_funds(callback: types.CallbackQuery):
     
     # Уведомляем администратора
     user_info = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.first_name
-    await bot.send_message(
-        ADMIN_ID,
-        f"🤑 <b>Новая заявка на вывод!</b>\n\n"
-        f"👤 Пользователь: {user_info} (ID: {callback.from_user.id})\n"
-        f"💰 Сумма: {balance:.2f} руб.\n"
-        f"📅 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        parse_mode="HTML"
-    )
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🤑 <b>Новая заявка на вывод!</b>\n\n"
+            f"👤 Пользователь: {user_info} (ID: {callback.from_user.id})\n"
+            f"💰 Сумма: {balance:.2f} руб.\n"
+            f"📅 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление админу: {e}")
     
-    await callback.message.edit_text(
-        f"✅ <b>Заявка на вывод создана!</b>\n\n"
-        f"💰 Сумма: {balance:.2f} руб.\n"
-        f"👤 Администратор свяжется с вами в течение 24 часов.\n\n"
-        f"⚠️ <b>Внимание:</b> Вывод осуществляется только на карту РФ.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")
-        ]]),
-        parse_mode="HTML"
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+    ])
+    
+    try:
+        await callback.message.edit_text(
+            f"✅ <b>Заявка на вывод создана!</b>\n\n"
+            f"💰 Сумма: {balance:.2f} руб.\n"
+            f"👤 Администратор свяжется с вами в течение 24 часов.\n\n"
+            f"⚠️ <b>Внимание:</b> Вывод осуществляется только на карту РФ.",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await callback.message.answer(
+            f"✅ <b>Заявка на вывод создана!</b>\n\n"
+            f"💰 Сумма: {balance:.2f} руб.\n"
+            f"👤 Администратор свяжется с вами в течение 24 часов.\n\n"
+            f"⚠️ <b>Внимание:</b> Вывод осуществляется только на карту РФ.",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    
     await callback.answer()
 
 # Обработчик кнопки "Статистика"
@@ -343,13 +394,23 @@ async def show_stats(callback: types.CallbackQuery):
         f"• Списания за отписки: {(invited_count - active_count) * 3} руб.\n"
     )
     
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")
-        ]]),
-        parse_mode="HTML"
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+    ])
+    
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await callback.message.answer(
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    
     await callback.answer()
 
 # Обработчик кнопки "Назад"
@@ -372,20 +433,37 @@ async def main_menu(callback: types.CallbackQuery):
             InlineKeyboardButton(text="📊 Статистика", callback_data="stats")
         )
         
-        await callback.message.edit_text(
-            f"👋 Добро пожаловать!\n\n"
-            f"🔗 <b>Ваша персональная ссылка:</b>\n"
-            f"<code>{user['invite_link']}</code>\n\n"
-            f"💵 <b>Заработок:</b>\n"
-            f"• За каждого приглашенного: +3 рубля\n"
-            f"• Если приглашенный отпишется: -3 рубля\n"
-            f"• Минимальная сумма вывода: 30 рублей\n\n"
-            f"⚠️ <b>Внимание:</b>\n"
-            f"• Оплата начисляется только за реальных пользователей\n"
-            f"• Вывод средств осуществляется через администратора",
-            reply_markup=builder.as_markup(),
-            parse_mode="HTML"
-        )
+        try:
+            await callback.message.edit_text(
+                f"👋 Добро пожаловать!\n\n"
+                f"🔗 <b>Ваша персональная ссылка:</b>\n"
+                f"<code>{user['invite_link']}</code>\n\n"
+                f"💵 <b>Заработок:</b>\n"
+                f"• За каждого приглашенного: +3 рубля\n"
+                f"• Если приглашенный отпишется: -3 рубля\n"
+                f"• Минимальная сумма вывода: 30 рублей\n\n"
+                f"⚠️ <b>Внимание:</b>\n"
+                f"• Оплата начисляется только за реальных пользователей\n"
+                f"• Вывод средств осуществляется через администратора",
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            await callback.message.answer(
+                f"👋 Добро пожаловать!\n\n"
+                f"🔗 <b>Ваша персональная ссылка:</b>\n"
+                f"<code>{user['invite_link']}</code>\n\n"
+                f"💵 <b>Заработок:</b>\n"
+                f"• За каждого приглашенного: +3 рубля\n"
+                f"• Если приглашенный отпишется: -3 рубля\n"
+                f"• Минимальная сумма вывода: 30 рублей\n\n"
+                f"⚠️ <b>Внимание:</b>\n"
+                f"• Оплата начисляется только за реальных пользователей\n"
+                f"• Вывод средств осуществляется через администратора",
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML"
+            )
+    
     await callback.answer()
 
 # Периодическая проверка участников канала
@@ -490,6 +568,8 @@ async def main():
     
     # Запускаем фоновую задачу проверки участников
     asyncio.create_task(check_channel_members())
+    
+    logger.info("Бот запущен!")
     
     # Запускаем бота
     await dp.start_polling(bot)
