@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sqlite3
 from typing import Dict, Optional
 from datetime import datetime
 
@@ -7,8 +8,6 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-import aiosqlite
-import sqlite3
 
 # Конфигурация
 BOT_TOKEN = "7725677007:AAELRuzM3MLnrWyi74PeWZgJDyqkwHzPPEo"
@@ -25,9 +24,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Инициализация базы данных
-async def init_db():
-    async with aiosqlite.connect(DATABASE_NAME) as db:
-        await db.execute('''
+def init_db():
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
@@ -38,7 +37,7 @@ async def init_db():
             )
         ''')
         
-        await db.execute('''
+        conn.execute('''
             CREATE TABLE IF NOT EXISTS invited_users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 inviter_id INTEGER,
@@ -49,7 +48,7 @@ async def init_db():
             )
         ''')
         
-        await db.execute('''
+        conn.execute('''
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
@@ -59,8 +58,7 @@ async def init_db():
                 FOREIGN KEY (user_id) REFERENCES users (user_id)
             )
         ''')
-        
-        await db.commit()
+        conn.commit()
 
 # Генерация уникальной пригласительной ссылки
 async def create_invite_link(user_id: int) -> str:
@@ -79,42 +77,41 @@ async def create_invite_link(user_id: int) -> str:
         return f"https://t.me/{CHANNEL_USERNAME}?start=ref{user_id}"
 
 # Получение пользователя из БД
-async def get_user(user_id: int):
-    async with aiosqlite.connect(DATABASE_NAME) as db:
-        async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                columns = [description[0] for description in cursor.description]
-                return dict(zip(columns, row))
-    return None
+def get_user(user_id: int):
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
 
 # Регистрация нового пользователя
 async def register_user(user_id: int, username: str, first_name: str):
-    async with aiosqlite.connect(DATABASE_NAME) as db:
-        user = await get_user(user_id)
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        user = get_user(user_id)
         if not user:
             invite_link = await create_invite_link(user_id)
-            await db.execute(
+            conn.execute(
                 'INSERT INTO users (user_id, username, first_name, invite_link) VALUES (?, ?, ?, ?)',
                 (user_id, username, first_name, invite_link)
             )
-            await db.commit()
+            conn.commit()
             return invite_link
         return user.get('invite_link')
 
 # Получение баланса
-async def get_balance(user_id: int) -> float:
-    user = await get_user(user_id)
+def get_balance(user_id: int) -> float:
+    user = get_user(user_id)
     return user['balance'] if user else 0
 
 # Обновление баланса
-async def update_balance(user_id: int, amount: float):
-    async with aiosqlite.connect(DATABASE_NAME) as db:
-        await db.execute(
+def update_balance(user_id: int, amount: float):
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        conn.execute(
             'UPDATE users SET balance = balance + ? WHERE user_id = ?',
             (amount, user_id)
         )
-        await db.commit()
+        conn.commit()
 
 # Проверка, является ли пользователь участником канала
 async def is_channel_member(user_id: int) -> bool:
@@ -178,32 +175,33 @@ async def cmd_start(message: types.Message):
 # Обработка реферала
 async def handle_referral(invited_user_id: int, inviter_id: int):
     # Проверяем, не регистрировался ли уже этот пользователь
-    async with aiosqlite.connect(DATABASE_NAME) as db:
-        async with db.execute(
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
             'SELECT * FROM invited_users WHERE invited_user_id = ?', 
             (invited_user_id,)
-        ) as cursor:
-            if await cursor.fetchone():
-                return
+        )
+        if cursor.fetchone():
+            return
         
         # Регистрируем приглашение
-        await db.execute(
+        conn.execute(
             '''INSERT INTO invited_users (inviter_id, invited_user_id) 
                VALUES (?, ?)''',
             (inviter_id, invited_user_id)
         )
-        await db.commit()
+        conn.commit()
         
     # Проверяем, вступил ли пользователь в канал
     if await is_channel_member(invited_user_id):
-        await update_balance(inviter_id, 3)
+        update_balance(inviter_id, 3)
         logger.info(f"Начислено 3 рубля пользователю {inviter_id} за приглашение {invited_user_id}")
 
 # Обработчик кнопки "Баланс"
 @dp.callback_query(F.data == "balance")
 async def show_balance(callback: types.CallbackQuery):
-    balance = await get_balance(callback.from_user.id)
-    invited_count = await get_invited_count(callback.from_user.id)
+    balance = get_balance(callback.from_user.id)
+    invited_count = get_invited_count(callback.from_user.id)
     
     text = (
         f"💳 <b>Ваш баланс:</b> {balance:.2f} руб.\n"
@@ -226,19 +224,20 @@ async def show_balance(callback: types.CallbackQuery):
     await callback.answer()
 
 # Получение количества приглашенных
-async def get_invited_count(user_id: int) -> int:
-    async with aiosqlite.connect(DATABASE_NAME) as db:
-        async with db.execute(
+def get_invited_count(user_id: int) -> int:
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
             'SELECT COUNT(*) FROM invited_users WHERE inviter_id = ?', 
             (user_id,)
-        ) as cursor:
-            result = await cursor.fetchone()
-            return result[0] if result else 0
+        )
+        result = cursor.fetchone()
+        return result[0] if result else 0
 
 # Обработчик кнопки "Пригласить друзей"
 @dp.callback_query(F.data == "invite")
 async def show_invite_link(callback: types.CallbackQuery):
-    user = await get_user(callback.from_user.id)
+    user = get_user(callback.from_user.id)
     if user:
         text = (
             f"🔗 <b>Ваша реферальная ссылка:</b>\n"
@@ -264,7 +263,7 @@ async def show_invite_link(callback: types.CallbackQuery):
 # Обработчик кнопки "Вывод средств"
 @dp.callback_query(F.data == "withdraw")
 async def withdraw_funds(callback: types.CallbackQuery):
-    balance = await get_balance(callback.from_user.id)
+    balance = get_balance(callback.from_user.id)
     
     if balance < 30:
         await callback.message.edit_text(
@@ -281,15 +280,15 @@ async def withdraw_funds(callback: types.CallbackQuery):
         return
     
     # Создаем заявку на вывод
-    async with aiosqlite.connect(DATABASE_NAME) as db:
-        await db.execute(
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        conn.execute(
             'INSERT INTO withdrawals (user_id, amount) VALUES (?, ?)',
             (callback.from_user.id, balance)
         )
-        await db.commit()
+        conn.commit()
     
     # Обнуляем баланс
-    await update_balance(callback.from_user.id, -balance)
+    update_balance(callback.from_user.id, -balance)
     
     # Уведомляем администратора
     user_info = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.first_name
@@ -318,19 +317,20 @@ async def withdraw_funds(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "stats")
 async def show_stats(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    balance = await get_balance(user_id)
-    invited_count = await get_invited_count(user_id)
+    balance = get_balance(user_id)
+    invited_count = get_invited_count(user_id)
     
     # Получаем активных приглашенных (которые сейчас в канале)
     active_count = 0
-    async with aiosqlite.connect(DATABASE_NAME) as db:
-        async with db.execute(
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
             '''SELECT COUNT(*) FROM invited_users 
                WHERE inviter_id = ? AND left_at IS NULL''',
             (user_id,)
-        ) as cursor:
-            result = await cursor.fetchone()
-            active_count = result[0] if result else 0
+        )
+        result = cursor.fetchone()
+        active_count = result[0] if result else 0
     
     text = (
         f"📊 <b>Ваша статистика:</b>\n\n"
@@ -356,7 +356,7 @@ async def show_stats(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "main_menu")
 async def main_menu(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    user = await get_user(user_id)
+    user = get_user(user_id)
     
     if user:
         builder = InlineKeyboardBuilder()
@@ -393,41 +393,42 @@ async def check_channel_members():
     while True:
         try:
             # Получаем всех приглашенных пользователей
-            async with aiosqlite.connect(DATABASE_NAME) as db:
-                async with db.execute(
+            with sqlite3.connect(DATABASE_NAME) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute(
                     '''SELECT iu.id, iu.inviter_id, iu.invited_user_id, iu.left_at 
                        FROM invited_users iu
                        WHERE iu.left_at IS NULL'''
-                ) as cursor:
-                    rows = await cursor.fetchall()
-                    columns = [description[0] for description in cursor.description]
-                    
-                    for row in rows:
-                        data = dict(zip(columns, row))
-                        user_id = data['invited_user_id']
-                        inviter_id = data['inviter_id']
-                        
-                        # Проверяем, состоит ли пользователь в канале
-                        is_member = await is_channel_member(user_id)
-                        
-                        if not is_member and data['left_at'] is None:
-                            # Пользователь вышел из канала
-                            await update_balance(inviter_id, -3)
-                            await db.execute(
-                                'UPDATE invited_users SET left_at = CURRENT_TIMESTAMP WHERE id = ?',
-                                (data['id'],)
-                            )
-                            logger.info(f"Списано 3 рубля с пользователя {inviter_id} за выход {user_id}")
-                        elif is_member and data['left_at'] is not None:
-                            # Пользователь снова вступил (не должно быть, но на всякий случай)
-                            await update_balance(inviter_id, 3)
-                            await db.execute(
-                                'UPDATE invited_users SET left_at = NULL WHERE id = ?',
-                                (data['id'],)
-                            )
-                            logger.info(f"Начислено 3 рубля пользователю {inviter_id} за возврат {user_id}")
+                )
+                rows = cursor.fetchall()
                 
-                await db.commit()
+                for row in rows:
+                    user_id = row['invited_user_id']
+                    inviter_id = row['inviter_id']
+                    record_id = row['id']
+                    
+                    # Проверяем, состоит ли пользователь в канале
+                    is_member = await is_channel_member(user_id)
+                    
+                    if not is_member:
+                        # Пользователь вышел из канала
+                        update_balance(inviter_id, -3)
+                        conn.execute(
+                            'UPDATE invited_users SET left_at = CURRENT_TIMESTAMP WHERE id = ?',
+                            (record_id,)
+                        )
+                        logger.info(f"Списано 3 рубля с пользователя {inviter_id} за выход {user_id}")
+                        conn.commit()
+                    elif is_member and row['left_at']:
+                        # Пользователь снова вступил (не должно быть, но на всякий случай)
+                        update_balance(inviter_id, 3)
+                        conn.execute(
+                            'UPDATE invited_users SET left_at = NULL WHERE id = ?',
+                            (record_id,)
+                        )
+                        logger.info(f"Начислено 3 рубля пользователю {inviter_id} за возврат {user_id}")
+                        conn.commit()
         
         except Exception as e:
             logger.error(f"Ошибка при проверке участников: {e}")
@@ -443,26 +444,29 @@ async def admin_panel(message: types.Message):
         return
     
     # Получаем статистику
-    async with aiosqlite.connect(DATABASE_NAME) as db:
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        
         # Общее количество пользователей
-        async with db.execute('SELECT COUNT(*) FROM users') as cursor:
-            total_users = (await cursor.fetchone())[0]
+        cursor.execute('SELECT COUNT(*) FROM users')
+        total_users = cursor.fetchone()[0]
         
         # Общее количество приглашенных
-        async with db.execute('SELECT COUNT(*) FROM invited_users') as cursor:
-            total_invited = (await cursor.fetchone())[0]
+        cursor.execute('SELECT COUNT(*) FROM invited_users')
+        total_invited = cursor.fetchone()[0]
         
         # Активные приглашенные
-        async with db.execute('SELECT COUNT(*) FROM invited_users WHERE left_at IS NULL') as cursor:
-            active_invited = (await cursor.fetchone())[0]
+        cursor.execute('SELECT COUNT(*) FROM invited_users WHERE left_at IS NULL')
+        active_invited = cursor.fetchone()[0]
         
         # Ожидающие выплаты
-        async with db.execute('SELECT COUNT(*) FROM withdrawals WHERE status = "pending"') as cursor:
-            pending_withdrawals = (await cursor.fetchone())[0]
+        cursor.execute('SELECT COUNT(*) FROM withdrawals WHERE status = "pending"')
+        pending_withdrawals = cursor.fetchone()[0]
         
         # Общая сумма выплат
-        async with db.execute('SELECT SUM(amount) FROM withdrawals WHERE status = "pending"') as cursor:
-            pending_amount = (await cursor.fetchone())[0] or 0
+        cursor.execute('SELECT SUM(amount) FROM withdrawals WHERE status = "pending"')
+        pending_amount_result = cursor.fetchone()
+        pending_amount = pending_amount_result[0] if pending_amount_result[0] else 0
     
     text = (
         f"📊 <b>Панель администратора</b>\n\n"
@@ -482,7 +486,7 @@ async def admin_panel(message: types.Message):
 # Запуск бота
 async def main():
     # Инициализируем БД
-    await init_db()
+    init_db()
     
     # Запускаем фоновую задачу проверки участников
     asyncio.create_task(check_channel_members())
